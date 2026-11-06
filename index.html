@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>AKRIBIS</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f2f4f6; --panel:#fff; --fg:#1b2530; --muted:#5b6876; --line:#cdd5de; --accent:#1f5fbf; --bad:#bb3529; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#10151b; --panel:#171e26; --fg:#e2e8ee; --muted:#93a1b0; --line:#2b3542; --accent:#6aa3f5; --bad:#f07060; } }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, "Segoe UI", sans-serif; }
+  #gate { min-height: 100%; display: grid; place-items: center; padding: 24px; }
+  form { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 24px; width: min(360px, 100%); display: grid; gap: 12px; }
+  h1 { margin: 0; font-size: 1.15rem; }
+  p { margin: 0; color: var(--muted); font-size: .88rem; }
+  input { font: inherit; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); width: 100%; }
+  button { font: inherit; font-weight: 600; padding: 9px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
+  #msg { min-height: 1.2em; color: var(--bad); font-size: .85rem; }
+  #frame { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; display: none; background: var(--bg); }
+</style>
+</head>
+<body>
+<div id="gate">
+  <form id="f" autocomplete="on">
+    <h1>AKRIBIS</h1>
+    <p>This page is encrypted. Enter the team password.</p>
+    <input id="pw" type="password" autocomplete="current-password" placeholder="Password" required autofocus>
+    <button id="go" type="submit">Open</button>
+    <div id="msg" role="alert"></div>
+  </form>
+</div>
+<iframe id="frame" title="AKRIBIS"></iframe>
+<script>
+"use strict";
+// Encrypted file next to this page. Format: {v, iter, salt, iv, ct} (base64), AES-256-GCM, key = PBKDF2-SHA256(password, salt).
+const DATA_FILE = "diagram.enc";
+const enc = new TextEncoder(), dec = new TextDecoder();
+const b64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+const unb64 = (s) => Uint8Array.from(atob(s.replace(/\s/g, "")), (c) => c.charCodeAt(0));
+
+let password = null, keys = {};          // derived keys cached by salt
+let cfg = null, sha = null, blob = null; // payload settings, GitHub file sha, current encrypted blob
+
+async function keyFor(saltB64, iter) {
+  const id = saltB64 + ":" + iter;
+  if (!keys[id]) {
+    const base = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+    keys[id] = await crypto.subtle.deriveKey({ name: "PBKDF2", hash: "SHA-256", salt: unb64(saltB64), iterations: iter },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  }
+  return keys[id];
+}
+async function decryptBlob(b) {
+  const key = await keyFor(b.salt, b.iter);
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(b.iv) }, key, unb64(b.ct));
+  return JSON.parse(dec.decode(pt));
+}
+async function encryptPayload(payload) {
+  const key = await keyFor(blob.salt, blob.iter);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(payload))));
+  return { v: 1, iter: blob.iter, salt: blob.salt, iv: b64(iv), ct: b64(ct) };
+}
+
+const api = (c) => `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.path}`;
+const ghHeaders = (c) => ({ "Authorization": "Bearer " + c.token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" });
+
+// Latest version straight from the repo (GitHub Pages can lag a minute or two behind a save).
+async function fetchLatest(c) {
+  const r = await fetch(api(c) + "?ref=" + encodeURIComponent(c.branch) + "&t=" + Date.now(), { headers: ghHeaders(c), cache: "no-store" });
+  if (!r.ok) throw Object.assign(new Error("GitHub " + r.status), { status: r.status });
+  const j = await r.json();
+  return { sha: j.sha, blob: JSON.parse(dec.decode(unb64(j.content))) };
+}
+
+window.__akribisHost = {
+  async save(html, rev) {
+    const payload = Object.assign({}, cfg, { html });
+    const next = await encryptPayload(payload);
+    const content = b64(enc.encode(JSON.stringify(next)));
+    if (!sha) { try { sha = (await fetchLatest(cfg)).sha; } catch (e) { /* fall through, PUT will report */ } }
+    let r;
+    try {
+      r = await fetch(api(cfg), { method: "PUT", headers: Object.assign({ "Content-Type": "application/json" }, ghHeaders(cfg)),
+        body: JSON.stringify({ message: "Diagram rev " + rev + " (saved from the web page)", content, sha, branch: cfg.branch }) });
+    } catch (e) { throw Object.assign(new Error("network error"), { code: "network" }); }
+    if (r.status === 409 || r.status === 422) throw Object.assign(new Error("conflict"), { code: "conflict" });
+    if (r.status === 401 || r.status === 403) throw Object.assign(new Error("not allowed (" + r.status + ")"), { code: "auth" });
+    if (!r.ok) throw Object.assign(new Error("GitHub " + r.status), { code: "http" });
+    sha = (await r.json()).content.sha;
+    blob = next;
+  }
+};
+
+const $ = (id) => document.getElementById(id);
+$("f").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("go").disabled = true; $("msg").textContent = ""; $("go").textContent = "Unlocking…";
+  password = $("pw").value; keys = {};
+  try {
+    const r = await fetch(DATA_FILE + "?t=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error("Could not load " + DATA_FILE + " (" + r.status + ")");
+    blob = await r.json();
+    let payload;
+    try { payload = await decryptBlob(blob); }
+    catch (e) { throw new Error("Wrong password."); }
+    cfg = { owner: payload.owner, repo: payload.repo, branch: payload.branch, path: payload.path, token: payload.token };
+    // Prefer the newest saved version, in case Pages has not rebuilt yet.
+    try {
+      const latest = await fetchLatest(cfg);
+      sha = latest.sha;
+      if (latest.blob.ct !== blob.ct) {
+        try { payload = await decryptBlob(latest.blob); blob = latest.blob; }
+        catch (e) { /* newer copy uses another password: keep the Pages copy */ sha = null; }
+      }
+    } catch (e) { console.warn("Could not check GitHub for a newer version:", e); }
+    $("gate").style.display = "none";
+    const fr = $("frame");
+    fr.srcdoc = payload.html;
+    fr.style.display = "block";
+    document.title = "AKRIBIS System Architecture";
+  } catch (e) {
+    $("msg").textContent = e.message || String(e);
+    $("go").disabled = false; $("go").textContent = "Open";
+  }
+});
+</script>
+</body>
+</html>
